@@ -4,7 +4,7 @@ Simple Header-Only C++14 (and newer) event handling library
 
 ## Requirements
 
-- C++20 compatible compiler
+- C++14 or newer compatible compiler
 - thats it :D
 
 ## Usage
