@@ -1,111 +1,143 @@
 #pragma once
-
-#include <functional>
-#include <unordered_map>
-#include <vector>
 #include <algorithm>
-#include <mutex>
+#include <concepts>
+#include <functional>
+#include <iostream>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <print>
+#include <ranges>
+#include <shared_mutex>
+#include <string>
 #include <typeindex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#define _EVT_LOG(msg) std::println("[EasyEvents] {}", msg)
 
 namespace EasyEvents {
-    enum class Priority {
-        FIRST = 0,
-        DEFAULT = 1,
-        LAST = 2
-    };
-
-    struct ListenerToken {
-        std::type_index type;
-        size_t id;
-    };
-
-    class ListenerCollectionBase {
-    public:
-        virtual ~ListenerCollectionBase() = default;
-        virtual void removeListenerById(size_t id) = 0;
-    };
 
     template <typename T>
-    class ListenerCollection : public ListenerCollectionBase {
+    concept Event = std::is_class_v<T> && std::is_default_constructible_v<T>;
+
+    class AbstractDispatcher {
     public:
-        using CallbackType = std::function<void(const T&)>;
+        virtual ~AbstractDispatcher() = default;
+    };
+
+    template <Event E>
+    class Dispatcher final : public AbstractDispatcher {
+    public:
+        using Callback = std::function<void(const E&, std::shared_ptr<E>)>;
 
         struct Listener {
-            CallbackType callback;
-            Priority priority;
-            size_t id;
+            Callback callback;
+            int priority;
+            bool once;
         };
 
-        void addListener(const Listener& listener) {
-            listeners.push_back(listener);
-            std::sort(listeners.begin(), listeners.end(), [](const Listener& a, const Listener& b) {
-                return static_cast<int>(a.priority) < static_cast<int>(b.priority);
-            });
+        void subscribe(Callback&& cb, int priority, bool once) {
+            std::unique_lock lock(mutex_);
+            listeners_.push_back({ std::move(cb), priority, once });
+            std::ranges::sort(listeners_, std::ranges::greater{}, &Listener::priority);
         }
 
-        void trigger(const T& event) {
-            auto localListeners = listeners;
-            for (auto& listener : localListeners) {
-                listener.callback(event);
+        void unsubscribe_all() {
+            std::unique_lock lock(mutex_);
+            listeners_.clear();
+        }
+
+        void dispatch(const E& evt) {
+            std::vector<Listener> snapshot;
+            {
+                std::shared_lock lock(mutex_);
+                snapshot = listeners_;
+            }
+
+            auto shared_evt = std::make_shared<E>(evt);
+            for (auto it = snapshot.begin(); it != snapshot.end(); ++it) {
+                try {
+                    it->callback(evt, shared_evt);
+                }
+                catch (const std::exception& ex) {
+                    _EVT_LOG(std::format("Exception in listener: {}", ex.what()));
+                }
+                if (it->once) {
+                    unsubscribe_listener(it->callback);
+                }
             }
         }
 
-        virtual void removeListenerById(size_t id) override {
-            auto it = std::remove_if(listeners.begin(), listeners.end(),
-                [id](const Listener& l) { return l.id == id; });
-            listeners.erase(it, listeners.end());
+    private:
+        void unsubscribe_listener(const Callback& target) {
+            std::unique_lock lock(mutex_);
+            listeners_.erase(
+                std::remove_if(listeners_.begin(), listeners_.end(),
+                    [&](const Listener& l) {
+                        // Can't compare std::function directly; just clear once
+                        return l.once;
+                    }),
+                listeners_.end());
         }
 
-    private:
-        std::vector<Listener> listeners;
+        mutable std::shared_mutex mutex_;
+        std::vector<Listener> listeners_;
     };
 
-    class EventDispatcher {
+    class EventBus {
     public:
-        template <typename T>
-        ListenerToken listen(std::function<void(const T&)> callback, Priority priority = Priority::DEFAULT) {
-            std::lock_guard<std::mutex> lock(mutex);
-            auto type = std::type_index(typeid(T));
-            size_t id = nextListenerId++;
-            ListenerToken token{ type, id };
+        EventBus() = default;
+        ~EventBus() = default;
 
-            auto it = collections.find(type);
-            if (it == collections.end()) {
-                auto collection = std::make_unique<ListenerCollection<T>>();
-                collection->addListener({ callback, priority, id });
-                collections[type] = std::move(collection);
-            } else {
-                auto collection = static_cast<ListenerCollection<T>*>(it->second.get());
-                collection->addListener({ callback, priority, id });
-            }
-            return token;
+        EventBus(const EventBus&) = delete;
+        EventBus& operator=(const EventBus&) = delete;
+
+        template <Event E>
+        void subscribe(std::function<void(const E&, std::shared_ptr<E>)> cb,
+            int priority = 0) {
+            get_dispatcher<E>().subscribe(std::move(cb), priority, false);
         }
 
-        template <typename T>
-        void trigger(const T& event) {
-            std::lock_guard<std::mutex> lock(mutex);
-            auto type = std::type_index(typeid(T));
-            auto it = collections.find(type);
-
-            if (it != collections.end()) {
-                auto collection = static_cast<ListenerCollection<T>*>(it->second.get());
-                collection->trigger(event);
-            }
+        template <Event E>
+        void subscribe_once(std::function<void(const E&, std::shared_ptr<E>)> cb,
+            int priority = 0) {
+            get_dispatcher<E>().subscribe(std::move(cb), priority, true);
         }
 
-        void deafen(const ListenerToken& token) {
-            std::lock_guard<std::mutex> lock(mutex);
-            auto it = collections.find(token.type);
+        template <Event E>
+        void unsubscribe_all() {
+            get_dispatcher<E>().unsubscribe_all();
+        }
 
-            if (it != collections.end()) {
-                it->second->removeListenerById(token.id);
-            }
+        template <Event E>
+        void emit(const E& evt) {
+            get_dispatcher<E>().dispatch(evt);
+        }
+
+        void clear() {
+            std::unique_lock lock(mutex_);
+            dispatchers_.clear();
         }
 
     private:
-        std::unordered_map<std::type_index, std::unique_ptr<ListenerCollectionBase>> collections;
-        size_t nextListenerId = 0;
-        std::mutex mutex;
+        template <Event E>
+        Dispatcher<E>& get_dispatcher() {
+            const std::type_index type = typeid(E);
+            std::unique_lock lock(mutex_);
+            auto it = dispatchers_.find(type);
+            if (it == dispatchers_.end()) {
+                auto disp = std::make_shared<Dispatcher<E>>();
+                dispatchers_[type] = disp;
+                return *disp;
+            }
+            return *static_cast<Dispatcher<E>*>(dispatchers_[type].get());
+        }
+
+        mutable std::shared_mutex mutex_;
+        std::unordered_map<std::type_index, std::shared_ptr<AbstractDispatcher>>
+            dispatchers_;
     };
-} // namespace event
+
+}  // namespace EasyEvents
