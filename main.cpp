@@ -1,42 +1,41 @@
-#include <iostream>
-#include "EasyEvents.hpp"
+#include "EasyEvents.h"
+#include <print>
+#include <string>
 
-struct EventA {
-    int value;
-};
-
-struct EventB {
-    std::string message;
+struct MyEvent {
+    std::string event_string_1;
+    bool cancelled = false;
 };
 
 int main() {
-    EasyEvents::EventDispatcher dispatcher;
+    EasyEvents::EventBus bus;
 
-    auto tokenA1 = dispatcher.listen<EventA>([](const EventA& e) {
-        std::cout << "[EventA - FIRST] Received value: " << e.value << "\n";
-    }, EasyEvents::Priority::FIRST);
+    bus.subscribe<MyEvent>(
+        [](const MyEvent& e, std::shared_ptr<MyEvent> shared) {
+            std::println("Listener A got: {}", e.event_string_1);
+            if (e.event_string_1 == "cancel_me") {
+                shared->cancelled = true;
+                std::println("Listener A cancelled event.");
+            }
+        },
+        10);
 
-    auto tokenA2 = dispatcher.listen<EventA>([](const EventA& e) {
-        std::cout << "[EventA - DEFAULT] Received value: " << e.value << "\n";
-    });
+    bus.subscribe<MyEvent>(
+        [](const MyEvent& e, std::shared_ptr<MyEvent> shared) {
+            if (shared->cancelled)
+                std::println("Listener B: event was cancelled!");
+            else
+                std::println("Listener B: {}", e.event_string_1);
+        },
+        5);
 
-    auto tokenA3 = dispatcher.listen<EventA>([](const EventA& e) {
-        std::cout << "[EventA - LAST] Received value: " << e.value << "\n";
-    }, EasyEvents::Priority::LAST);
+    bus.subscribe_once<MyEvent>(
+        [](const MyEvent& e, std::shared_ptr<MyEvent>) {
+            std::println("One-shot listener triggered once with '{}'",
+                e.event_string_1);
+        });
 
-    auto tokenB = dispatcher.listen<EventB>([](const EventB& e) {
-        std::cout << "[EventB] Received message: " << e.message << "\n";
-    });
-
-    std::cout << "Triggering EventA with value 42:" << std::endl;
-    dispatcher.trigger(EventA{ 42 });
-
-    std::cout << "\nTriggering EventB with message \"Hello World\": " << std::endl;
-    dispatcher.trigger(EventB{ "Hello World" });
-
-    dispatcher.deafen(tokenA2);
-    std::cout << "\nAfter removing DEFAULT listener for EventA, triggering with value 84:" << std::endl;
-    dispatcher.trigger(EventA{ 84 });
-
-    return 0;
+    bus.emit(MyEvent{ "hello world" });
+    bus.emit(MyEvent{ "cancel_me" });
+    bus.emit(MyEvent{ "after cancel" });
 }
